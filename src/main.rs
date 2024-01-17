@@ -1,6 +1,11 @@
+#![allow(unused, unused_mut)]
+
+use libc::c_int;
 use nix::errno::Errno;
 use nix::fcntl::{fcntl, FcntlArg, FdFlag};
 use nix::pty::OpenptyResult;
+
+use termios::Termios;
 
 use dotenvy::Error as DotError;
 
@@ -24,31 +29,26 @@ impl Args {
         let mut shell: Option<String> = None;
         let mut mode = WriterMode::String;
 
-        loop {
-            match args.next() {
-                Some(arg) => {
-                    if arg == "--shell" {
-                        if let Some(arg) = args.next() {
-                            shell = Some(arg);
-                        } else {
-                            break;
-                        }
-                    } else if arg == "--mod" {
-                        if let Some(arg) = args.next() {
-                            if arg == "str" {
-                                mode = WriterMode::String;
-                            } else if arg == "bytes" {
-                                mode = WriterMode::Bytes;
-                            }
-                        } else {
-                            break;
-                        }
-                    } else if arg == "--help" {
-                        print_help();
-                        return None;
-                    }
+        while let Some(arg) = args.next() {
+            if arg == "--shell" {
+                if let Some(arg) = args.next() {
+                    shell = Some(arg);
+                } else {
+                    break;
                 }
-                None => break,
+            } else if arg == "--mod" {
+                if let Some(arg) = args.next() {
+                    if arg == "str" {
+                        mode = WriterMode::String;
+                    } else if arg == "bytes" {
+                        mode = WriterMode::Bytes;
+                    }
+                } else {
+                    break;
+                }
+            } else if arg == "--help" {
+                print_help();
+                return None;
             }
         }
 
@@ -64,12 +64,13 @@ fn print_help() {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(args) = Args::from_command_line() {
         let OpenptyResult { master, slave } = open_pty()?;
+        let mut term = termios::Termios::from_fd(master.as_raw_fd())?;
+        debug_termios(&term);
 
         let env = match dotenvy::dotenv_iter() {
             Ok(env) => {
                 let env: Result<Vec<_>, _> = env.collect();
-                let env = env?;
-                env
+                env?
             }
             Err(DotError::Io(e)) => {
                 if matches!(e.kind(), IoErrorKind::NotFound) {
@@ -85,6 +86,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let mut child = cmd.spawn()?;
         drop(slave);
+        println!("Child PID {}", child.id());
 
         spawn_reader(master.as_raw_fd());
 
@@ -121,7 +123,7 @@ fn build_cmd(
         cmd.stdin(Stdio::from_raw_fd(slave))
             .stdout(Stdio::from_raw_fd(slave))
             .stderr(Stdio::from_raw_fd(slave))
-            .pre_exec(|| {
+            .pre_exec(move || {
                 let res = libc::setsid();
                 if res == -1 {
                     return Err(IoError::last_os_error());
@@ -155,7 +157,7 @@ fn spawn_reader(master: RawFd) {
                     println!("READ");
                     println!("{buf_str:?}");
                     println!("{buf:02x?}");
-                    println!("");
+                    println!();
                 }
                 Err(Errno::EIO) => {
                     println!("Got Errno::EIO");
@@ -171,6 +173,7 @@ fn spawn_reader(master: RawFd) {
 }
 
 fn execute(cmd: &[u8], master: RawFd) -> Result<(), IoError> {
+    println!("> {cmd:02x?}");
     if let Err(e) = nix::unistd::write(master, cmd) {
         println!("Error when writing to the master: {e:?}");
         Err(IoError::from_raw_os_error(e as _))
@@ -214,10 +217,10 @@ fn write_loop(master: RawFd, mode: WriterMode) -> Result<(), IoError> {
 
 fn parse_bytes(buf: &str) -> Vec<u8> {
     let mut cmd = Vec::new();
-    let buf = if buf.ends_with('\n') {
-        &buf[..(buf.len() - 1)]
+    let buf = if let Some(buf) = buf.strip_suffix('\n') {
+        buf
     } else {
-        &buf[..]
+        buf
     };
 
     for byte in buf.split(' ') {
@@ -227,4 +230,101 @@ fn parse_bytes(buf: &str) -> Vec<u8> {
     }
 
     cmd
+}
+
+fn debug_termios(term: &Termios) {
+    use ::termios::os::target::VSWTC as VSWTCH;
+    use ::termios::os::target::*;
+    use std::collections::BTreeMap;
+    use std::fmt;
+
+    macro_rules! flag_list {
+        ($($flag: ident,)*) => {{
+            [ $( ($flag, stringify!($flag)), )* ]
+        }};
+    }
+
+    let iflags = flag_list![
+        IGNBRK, BRKINT, IGNPAR, PARMRK, INPCK, ISTRIP, INLCR, ICRNL, IUCLC, IXON, IXANY, IXOFF,
+        IMAXBEL, IUTF8,
+    ];
+    let oflags = flag_list![
+        OPOST, OLCUC, ONLCR, OCRNL, ONOCR, ONLRET, OFILL, OFDEL, NLDLY, CRDLY, TABDLY, BSDLY,
+        VTDLY, FFDLY,
+    ];
+    let cflags = flag_list![
+        CBAUD, CBAUDEX, CSIZE, CSTOPB, CREAD, PARENB, PARODD, HUPCL, CLOCAL, CIBAUD, CMSPAR,
+        CRTSCTS,
+    ];
+    let lflags = flag_list![
+        ISIG, ICANON, XCASE, ECHO, ECHOE, ECHOK, ECHONL, ECHOCTL, ECHOPRT, ECHOKE, FLUSHO, NOFLSH,
+        TOSTOP, PENDIN, IEXTEN,
+    ];
+    let cc = flag_list![
+        VDISCARD, VEOF, VEOL, VEOL2, VERASE, VINTR, VKILL, VLNEXT, VMIN, VQUIT, VREPRINT, VSTART,
+        VSTOP, VSUSP, VSWTCH, VTIME, VWERASE,
+    ];
+
+    #[derive(Debug)]
+    struct Flag {
+        r#in: Vec<&'static str>,
+        out: Vec<&'static str>,
+    }
+
+    fn split(target: tcflag_t, flags: &[(tcflag_t, &'static str)]) -> Flag {
+        let mut r#in = Vec::new();
+        let mut out = Vec::new();
+
+        for &(flag, name) in flags {
+            if target & flag == 0 {
+                out.push(name);
+            } else {
+                r#in.push(name);
+            }
+        }
+
+        Flag { r#in, out }
+    }
+
+    struct Cc(BTreeMap<&'static str, cc_t>);
+
+    fn special_char_map(target: &[cc_t], cc: &[(usize, &'static str)]) -> Cc {
+        let mut map = BTreeMap::new();
+
+        for &(c, name) in cc {
+            map.insert(name, target[c]);
+        }
+
+        Cc(map)
+    }
+
+    struct DebugTermios {
+        c_iflag: Flag,
+        c_oflag: Flag,
+        c_cflag: Flag,
+        c_lflag: Flag,
+        c_cc: Cc,
+    }
+
+    let new_dbg = || DebugTermios {
+        c_iflag: split(term.c_iflag, &iflags),
+        c_oflag: split(term.c_oflag, &oflags),
+        c_cflag: split(term.c_cflag, &cflags),
+        c_lflag: split(term.c_lflag, &lflags),
+        c_cc: special_char_map(&term.c_cc, &cc),
+    };
+
+    impl fmt::Debug for DebugTermios {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("Termios")
+                .field("c_iflag", &self.c_iflag)
+                .field("c_oflag", &self.c_oflag)
+                .field("c_cflag", &self.c_cflag)
+                .field("c_lflag", &self.c_lflag)
+                .field("c_cc", &self.c_cc.0)
+                .finish()
+        }
+    }
+
+    println!("{:x?}", new_dbg());
 }
